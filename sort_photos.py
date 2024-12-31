@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-Organize Google Takeout Photos/Videos by year, with robust fallback logic:
-1. Files containing "snapchat" in their name => 'Snapchat/' folder (no date parsing).
-2. Other files: Use EXIF -> JSON -> filename -> directory -> mod-time to guess a year.
-   If the year is outside [2000..current_year], place in 'Unknown/'.
-   Otherwise, place in 'YYYY/' (e.g., '2021/').
-3. .heic/.heif files are converted to .jpg; others are copied as-is.
-4. Use '--test' to limit to 100 files and print debug logs.
+Organize Google Takeout Photos/Videos by year, with a robust fallback workflow:
+1. If the filename contains "snapchat", place in 'Snapchat/' (no date parsing).
+2. For other files, determine the best-guess date from:
+       EXIF -> JSON sidecar -> filename -> directory name -> file mod-time.
+   - If the resulting year is outside [2000..current_year], place in 'Unknown/'.
+   - Otherwise, place in a folder named by that year, e.g. '2021/'.
+3. Convert .heic/.heif files to .jpg (requires 'pillow-heif'), copy others as-is.
+4. Use '--test' to process only 100 files and display debug logs.
+
+Tips to avoid "Too many files open":
+- We break out early in test mode, so we don't crawl every folder once we hit 100 files.
+- We explicitly use `followlinks=False` in os.walk to skip symlinks that might cause loops.
+- If you still hit limits, consider raising your OS file-descriptor cap (e.g., `ulimit -n 4096` on macOS/Linux).
 
 Requires:
-   pip install pillow pillow-heif  (optional but recommended for .heic support)
+  pip install pillow pillow-heif
 """
 
 import os
@@ -28,26 +34,24 @@ except ImportError:
 
 
 def debug_print(msg: str) -> None:
-    """Print debug messages (you can silence them in production if desired)."""
+    """Helper function for debug messages (feel free to silence them in production)."""
     print(f"[DEBUG] {msg}")
 
 
 def current_year() -> int:
-    """Return the current calendar year as an integer."""
+    """Return the current calendar year."""
     return date.today().year
 
 
 def is_reasonable_year(year: int, min_year: int = 2000) -> bool:
-    """
-    Check if a 'year' is in the inclusive range [min_year..current_year].
-    """
+    """Check if 'year' is within [min_year..current_year]."""
     return min_year <= year <= current_year()
 
 
 def get_exif_datetime(path: str) -> datetime | None:
     """
     Attempt to read EXIF 'DateTimeOriginal' from an image.
-    Return a datetime if found and the year is reasonable, else None.
+    Return a datetime if valid and within a reasonable year, else None.
     """
     try:
         with Image.open(path) as img:
@@ -59,7 +63,7 @@ def get_exif_datetime(path: str) -> datetime | None:
             for tag_id, value in exif_data.items():
                 tag_name = ExifTags.TAGS.get(tag_id, tag_id)
                 if tag_name in ("DateTimeOriginal", "DateTime"):
-                    # EXIF date is usually "YYYY:MM:DD HH:MM:SS"
+                    # Typically "YYYY:MM:DD HH:MM:SS"
                     try:
                         dt_obj = datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
                         if is_reasonable_year(dt_obj.year):
@@ -78,40 +82,43 @@ def get_exif_datetime(path: str) -> datetime | None:
 
 def find_companion_json(path: str) -> str | None:
     """
-    Locate a Google Takeout sidecar JSON (e.g., 'IMG_1234.jpg.json') if it exists.
+    Locate a Google Takeout sidecar JSON (e.g., 'IMG_1234.jpg.json') in the same folder.
     Return the JSON path if found, else None.
     """
     base, _ = os.path.splitext(path)
     directory = os.path.dirname(path)
     filename_no_ext = os.path.basename(base)
 
-    # 1) <filename>.<ext>.json
+    # 1) Direct guess: <filename>.<ext>.json
     guess = path + ".json"
     if os.path.isfile(guess):
         return guess
 
-    # 2) <filename>(1).jpg.json or similar
-    for fname in os.listdir(directory):
-        if not fname.lower().endswith(".json"):
-            continue
-        if fname.startswith(filename_no_ext):
-            candidate = os.path.join(directory, fname)
-            if os.path.isfile(candidate):
-                return candidate
+    # 2) Something like <filename>(1).jpg.json
+    try:
+        for fname in os.listdir(directory):
+            if not fname.lower().endswith(".json"):
+                continue
+            if fname.startswith(filename_no_ext):
+                candidate = os.path.join(directory, fname)
+                if os.path.isfile(candidate):
+                    return candidate
+    except Exception as e:
+        debug_print(f"Error listing directory '{directory}': {e}")
 
     return None
 
 
 def parse_date_from_json(json_path: str) -> datetime | None:
     """
-    Check typical fields in Takeout JSON: photoTakenTime, creationTime, videoCreationTime.
+    Read typical date fields from Takeout sidecar JSON: photoTakenTime, creationTime, videoCreationTime.
     Return a datetime if valid & year in [2000..current_year], else None.
     """
     try:
         with open(json_path, "r", encoding="utf-8") as jf:
             data = json.load(jf)
 
-        # e.g.,
+        # Example:
         # {
         #   "photoTakenTime": {"timestamp": "1583883667"},
         #   "creationTime": {"timestamp": "1609459200"},
@@ -134,8 +141,8 @@ def parse_date_from_json(json_path: str) -> datetime | None:
 
 def parse_epoch(epoch_str: str) -> datetime | None:
     """
-    Try interpreting 'epoch_str' as 9, 10, or 13-digit Unix epoch time.
-    Return a datetime if valid and year in [2000..current_year], else None.
+    Interpret 'epoch_str' as a 9, 10, or 13-digit Unix epoch (seconds/milliseconds).
+    Return a datetime if valid & year in [2000..current_year], else None.
     """
     if not epoch_str.isdigit():
         return None
@@ -169,10 +176,10 @@ def parse_strict_filename_date(filename: str) -> datetime | None:
     """
     name_lower = filename.lower()
     pattern = r'(\d{4})[-_]?(\d{2})[-_]?(\d{2})'
-    m = re.search(pattern, name_lower)
-    if m:
+    match = re.search(pattern, name_lower)
+    if match:
         try:
-            y_str, m_str, d_str = m.groups()
+            y_str, m_str, d_str = match.groups()
             year, month, day = int(y_str), int(m_str), int(d_str)
             if is_reasonable_year(year) and 1 <= month <= 12 and 1 <= day <= 31:
                 dt = datetime(year, month, day)
@@ -185,9 +192,8 @@ def parse_strict_filename_date(filename: str) -> datetime | None:
 
 def parse_additional_filename_date(filename: str) -> datetime | None:
     """
-    Patterns:
-      1) 8-digit: YYYYMMDD => date
-      2) 6-digit: YYYYMM => date with day=1
+    1) 8-digit: YYYYMMDD => date
+    2) 6-digit: YYYYMM => date (day=1)
     """
     name_lower = filename.lower()
 
@@ -222,11 +228,11 @@ def parse_additional_filename_date(filename: str) -> datetime | None:
 
 def parse_all_digits_any_prefix(filename: str) -> datetime | None:
     """
-    If a file is named 'IMG123456' or purely digits, attempt parse_epoch.
-    Return None if no luck or out of range.
+    If the file is named something like 'IMG123456789' or purely digits,
+    try interpreting the numeric part as a Unix epoch. Return None if invalid.
     """
     base_no_ext, _ = os.path.splitext(filename.lower())
-    # Remove known prefixes
+
     known_prefixes = ["img", "img_", "image", "picture", "photo"]
     for p in known_prefixes:
         if base_no_ext.startswith(p):
@@ -245,10 +251,10 @@ def parse_all_digits_any_prefix(filename: str) -> datetime | None:
 
 def parse_date_from_filename(filename: str) -> datetime | None:
     """
-    Try filename-based strategies in order:
+    Try filename-based strategies:
       1) Strict (YYYY-MM-DD)
       2) Additional (YYYYMMDD, etc.)
-      3) All-digits fallback (epoch).
+      3) All-digits fallback (epoch)
     Return None if nothing found.
     """
     dt_strict = parse_strict_filename_date(filename)
@@ -269,8 +275,8 @@ def parse_date_from_filename(filename: str) -> datetime | None:
 
 def parse_date_from_directory(dir_path: str) -> datetime | None:
     """
-    Check if any parent folder has a pattern like mm[-_]dd[-_]yyyy.
-    Return a datetime if valid, else None.
+    Check for a folder name with mm[-_]dd[-_]yyyy in any parent directory.
+    Return a datetime if found, else None.
     """
     parts = dir_path.split(os.sep)
     pattern = re.compile(r'(\d{1,2})[-_](\d{1,2})[-_](\d{4})')
@@ -293,8 +299,13 @@ def parse_date_from_directory(dir_path: str) -> datetime | None:
 
 def get_creation_datetime(file_path: str) -> datetime:
     """
-    Consolidate all fallback logic (EXIF -> JSON -> filename -> directory -> mod-time).
-    Return the best guess or fallback to mod-time.
+    Consolidate all date-finding logic:
+      1) EXIF
+      2) JSON sidecar
+      3) Filename
+      4) Directory name
+      5) File mod-time (fallback)
+    Return a datetime object as the best guess.
     """
     dt_exif = get_exif_datetime(file_path)
     if dt_exif:
@@ -311,11 +322,10 @@ def get_creation_datetime(file_path: str) -> datetime:
     if dt_file:
         return dt_file
 
-    dir_dt = parse_date_from_directory(os.path.dirname(file_path))
-    if dir_dt:
-        return dir_dt
+    dt_dir = parse_date_from_directory(os.path.dirname(file_path))
+    if dt_dir:
+        return dt_dir
 
-    # Fallback: modification time
     mod_time = os.path.getmtime(file_path)
     dt_mod = datetime.fromtimestamp(mod_time)
     debug_print(f"Mod-time => {dt_mod} for {file_path}")
@@ -324,7 +334,7 @@ def get_creation_datetime(file_path: str) -> datetime:
 
 def is_media_file(filename: str) -> bool:
     """
-    Check if the file extension is a recognized image/video format.
+    Check if this file is a recognized image/video format.
     """
     ext = os.path.splitext(filename)[1].lower()
     media_extensions = [
@@ -337,8 +347,7 @@ def is_media_file(filename: str) -> bool:
 
 def convert_heic_to_jpg(source_path: str, dest_path: str) -> None:
     """
-    Convert .heic/.heif to .jpg using Pillow.
-    If pillow_heif is installed, it can open .heic. Otherwise, this may fail.
+    Convert .heic/.heif to .jpg using Pillow (and pillow_heif if installed).
     """
     with Image.open(source_path) as im:
         im = im.convert("RGB")
@@ -348,7 +357,7 @@ def convert_heic_to_jpg(source_path: str, dest_path: str) -> None:
 
 def copy_or_convert_file(source_path: str, dest_path: str) -> None:
     """
-    If the source is .heic/.heif, convert to .jpg. Otherwise, copy as-is.
+    If the source is .heic/.heif, convert to .jpg; otherwise, copy the file.
     Skip if the destination already exists.
     """
     ext = os.path.splitext(source_path)[1].lower()
@@ -372,14 +381,11 @@ def copy_or_convert_file(source_path: str, dest_path: str) -> None:
 
 def main(input_root: str, output_root: str, test_mode: bool = False) -> None:
     """
-    1. Walk subfolders under 'input_root' that contain "Google Photos".
-    2. If a filename contains 'snapchat', place in 'Snapchat/' ignoring date logic.
-    3. Otherwise:
-       - Derive a best-guess year from EXIF/JSON/filename/directory mod-time.
-       - If out of [2000..current_year], place in 'Unknown/' folder.
-       - Else place in 'YYYY/' folder.
-    4. Convert .heic => .jpg, copy everything else.
-    5. If test_mode=True, stop after 100 items and show debug logs.
+    1. Recursively walk subfolders in 'input_root' containing 'Google Photos' (followlinks=False).
+    2. If filename contains 'snapchat', place in 'Snapchat/' ignoring date logic.
+    3. Else, attempt to parse a year via get_creation_datetime(). If out-of-range => 'Unknown/',
+       otherwise => 'YYYY/'.
+    4. Convert .heic -> .jpg, copy everything else, up to 100 items in test mode.
     """
     if not os.path.exists(output_root):
         os.makedirs(output_root)
@@ -387,20 +393,22 @@ def main(input_root: str, output_root: str, test_mode: bool = False) -> None:
     processed_count = 0
     MAX_TEST_COUNT = 100
 
-    for root, dirs, files in os.walk(input_root):
-        # Only consider folders containing "Google Photos"
+    # Use followlinks=False to avoid infinite loops or excessive handles through symlinks
+    for root, dirs, files in os.walk(input_root, followlinks=False):
+        # We only care about folders containing "Google Photos"
         if "Google Photos" not in root:
             continue
 
         for filename in files:
-            # Skip .json sidecar files themselves
+            # Skip any .json sidecar
             if filename.lower().endswith(".json"):
                 continue
 
-            # Only process recognized media
+            # Only handle known media
             if not is_media_file(filename):
                 continue
 
+            # Short-circuit in test mode to avoid scanning every folder
             if test_mode and processed_count >= MAX_TEST_COUNT:
                 print(f"\nReached {MAX_TEST_COUNT} files in test mode; stopping.\n")
                 return
@@ -408,11 +416,10 @@ def main(input_root: str, output_root: str, test_mode: bool = False) -> None:
             source_path = os.path.join(root, filename)
             filename_lower = filename.lower()
 
-            # If 'snapchat' is anywhere in the name, place in 'Snapchat/'
+            # Route 'snapchat' files to 'Snapchat/' folder
             if "snapchat" in filename_lower:
                 folder_name = "Snapchat"
             else:
-                # Normal date logic
                 dt_estimated = get_creation_datetime(source_path)
                 year = dt_estimated.year
                 if not is_reasonable_year(year):
@@ -439,15 +446,14 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description=(
-            "Organize Google Takeout media by best guess year "
-            "(EXIF/JSON/filename/etc.). "
-            "Any file containing 'snapchat' => 'Snapchat/' folder. "
-            "Others out-of-range => 'Unknown/'."
+            "Organize Google Takeout media by best guess year (EXIF/JSON/filename/etc.). "
+            "Files with 'snapchat' go to 'Snapchat/', out-of-range years go to 'Unknown/'."
         )
     )
-    parser.add_argument("input_root", help="Top-level folder with 'Takeout N' subfolders.")
-    parser.add_argument("output_root", help="Where to place the organized results.")
+    parser.add_argument("input_root", help="Top-level folder containing 'Takeout N' subfolders.")
+    parser.add_argument("output_root", help="Destination folder for organized results.")
     parser.add_argument("--test", action="store_true", help="Process only 100 files, for safety.")
+
     args = parser.parse_args()
 
     if not os.path.isdir(args.input_root):
